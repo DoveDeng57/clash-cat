@@ -4,10 +4,12 @@ import { join } from 'path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { getOverrideConfig, updateOverrideConfig } from './override'
 import {
+  addProfileItem,
   createProfile,
   getProfileConfig,
   getProfileItem,
   removeProfileItem,
+  setProfileConfig,
   updateProfileConfig,
   updateProfileItem,
   upsertPluginProfile,
@@ -273,6 +275,174 @@ describe('profile deletion (R2-ISS-034 / R2-ISS-067)', () => {
     await removeProfileItem('remote')
     expect(existsSync(workDir)).toBe(false)
     expect(readFileSync(join(testDir, 'profile.yaml'), 'utf8')).not.toContain('id: remote')
+  })
+})
+
+describe('profile.yaml write keeps the parameters a refresh did not provide', () => {
+  const seededConfig = `current: remote
+items:
+  - id: remote
+    type: remote
+    name: Remote
+    url: https://example.test/sub
+    interval: 1440
+    home: https://example.test/dashboard
+    override:
+      - O1
+    extra:
+      upload: 1
+      download: 2
+      total: 3
+      expire: 4
+`
+
+  const remoteRecord = async (): Promise<IProfileItem> => {
+    const item = await getProfileItem('remote')
+    if (!item) throw new Error('seeded record missing')
+    return item
+  }
+
+  it('keeps home / override when the response no longer carries them', async () => {
+    writeFileSync(join(testDir, 'profile.yaml'), seededConfig)
+    await getProfileConfig(true)
+
+    await addProfileItem(await remoteRecord())
+
+    expect(await getProfileItem('remote')).toMatchObject({
+      home: 'https://example.test/dashboard',
+      override: ['O1'],
+      interval: 1440,
+      updated: expect.any(Number)
+    })
+    expect(readFileSync(join(testDir, 'profile.yaml'), 'utf8')).toContain(
+      'home: https://example.test/dashboard'
+    )
+  })
+
+  it('clears the traffic info (extra) when the response stops sending subscription-userinfo', async () => {
+    writeFileSync(join(testDir, 'profile.yaml'), seededConfig)
+    await getProfileConfig(true)
+
+    await addProfileItem(await remoteRecord()) // 响应不带 subscription-userinfo
+
+    expect((await getProfileItem('remote'))?.extra).toBeUndefined()
+    expect(readFileSync(join(testDir, 'profile.yaml'), 'utf8')).not.toContain('upload: 1')
+  })
+
+  it('a refresh in flight while the user deletes the subscription does not resurrect it', async () => {
+    writeFileSync(join(testDir, 'profile.yaml'), seededConfig)
+    await getProfileConfig(true)
+    const record = await remoteRecord()
+
+    let release!: (value: unknown) => void
+    mocks.axiosGet.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = resolve
+        })
+    )
+    const refreshing = addProfileItem(record)
+    await new Promise((r) => setTimeout(r, 10)) // 拉取已挂在 axios 上
+    await removeProfileItem('remote') // 用户在拉取期间删除了订阅
+    release({ status: 200, data: newProfile, headers: { 'content-type': 'text/yaml' } })
+    await refreshing
+
+    expect(await getProfileItem('remote')).toBeUndefined()
+    expect(existsSync(join(testDir, 'profiles', 'remote.yaml'))).toBe(false)
+    expect(readFileSync(join(testDir, 'profile.yaml'), 'utf8')).not.toContain('id: remote')
+  })
+
+  it('lets the response overwrite the parameters it does carry', async () => {
+    writeFileSync(join(testDir, 'profile.yaml'), seededConfig)
+    mocks.axiosGet.mockResolvedValue({
+      status: 200,
+      data: newProfile,
+      headers: {
+        'content-type': 'text/yaml',
+        'profile-web-page-url': 'https://example.test/new-dashboard',
+        'subscription-userinfo': 'upload=9; download=9; total=9; expire=9'
+      }
+    })
+    await getProfileConfig(true)
+
+    await addProfileItem(await remoteRecord())
+
+    expect(await getProfileItem('remote')).toMatchObject({
+      home: 'https://example.test/new-dashboard',
+      extra: { upload: 9, download: 9, total: 9, expire: 9 }
+    })
+  })
+
+  it('inserts a record with no previous entry as-is (nothing to merge with)', async () => {
+    writeFileSync(join(testDir, 'profile.yaml'), 'items: []\n')
+    await getProfileConfig(true)
+
+    await addProfileItem({ id: 'fresh', type: 'remote', url: 'https://example.test/fresh' })
+
+    expect(await getProfileItem('fresh')).toMatchObject({
+      id: 'fresh',
+      type: 'remote',
+      url: 'https://example.test/fresh',
+      override: []
+    })
+  })
+
+  it('adds the parameters a refresh introduces (both sides are taken in full)', async () => {
+    writeFileSync(join(testDir, 'profile.yaml'), seededConfig)
+    await getProfileConfig(true)
+
+    // 接口上还没有的字段：请求里给出了，记录里就必须有
+    await addProfileItem({ ...(await remoteRecord()), tunnel: 'keep' } as Partial<IProfileItem>)
+
+    expect(await getProfileItem('remote')).toMatchObject({
+      tunnel: 'keep',
+      home: 'https://example.test/dashboard'
+    })
+    expect(readFileSync(join(testDir, 'profile.yaml'), 'utf8')).toContain('tunnel: keep')
+  })
+
+  it('a partial edit payload keeps what it does not mention, but an explicit clear still wins', async () => {
+    writeFileSync(join(testDir, 'profile.yaml'), seededConfig)
+    await getProfileConfig(true)
+
+    await updateProfileItem({ id: 'remote', name: 'Renamed' } as IProfileItem)
+
+    expect(await getProfileItem('remote')).toMatchObject({
+      name: 'Renamed',
+      url: 'https://example.test/sub',
+      interval: 1440,
+      home: 'https://example.test/dashboard',
+      override: ['O1'],
+      extra: { upload: 1, download: 2, total: 3, expire: 4 }
+    })
+
+    // 键存在且值为 undefined（编辑器里的“清空”）仍然落盘为空：字段从文件里消失
+    await updateProfileItem({ ...(await remoteRecord()), home: undefined })
+
+    expect((await getProfileItem('remote'))?.home).toBeUndefined()
+    expect(readFileSync(join(testDir, 'profile.yaml'), 'utf8')).not.toContain('dashboard')
+  })
+
+  it('a list write (reorder) keeps record-only parameters and still honours removals', async () => {
+    writeFileSync(
+      join(testDir, 'profile.yaml'),
+      `${seededConfig}  - id: other\n    type: remote\n    name: Other\n    url: https://example.test/other\n`
+    )
+    await getProfileConfig(true)
+
+    await setProfileConfig({
+      current: 'remote',
+      items: [{ id: 'remote', type: 'remote', name: 'Remote' }]
+    })
+
+    expect(await getProfileItem('remote')).toMatchObject({
+      interval: 1440,
+      home: 'https://example.test/dashboard',
+      override: ['O1'],
+      extra: { upload: 1, download: 2, total: 3, expire: 4 }
+    })
+    // 列表里没有的记录仍然被删除
+    expect(await getProfileItem('other')).toBeUndefined()
   })
 })
 

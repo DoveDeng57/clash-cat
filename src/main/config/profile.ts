@@ -40,6 +40,11 @@ const profileConfigWriteQueue = runtimeConfigWriteQueue
 let changeProfileQueue: Promise<void> = Promise.resolve()
 // 并发去重
 const inflightRemoteFetches = new Map<string, Promise<IProfileItem>>()
+// 每个 id 最近一次被删除的序号：订阅刷新可能在拉取期间被用户删除，拉取回来时若序号变了就说明记录已被删除，
+// 本次结果（记录 + 订阅文件）不得写回——用户手动删除必须删得掉。用序号而不是“永久已删除集合”，
+// 同一个 id 重新建立后再次刷新不会被误伤。
+const profileDeletionEpoch = new Map<string, number>()
+let profileDeletionCounter = 0
 
 function isPermissionError(error: unknown): boolean {
   const code = (error as NodeJS.ErrnoException)?.code
@@ -94,6 +99,39 @@ async function removeProfileWorkDir(id: string): Promise<void> {
 // 每次经写队列提交的写入 +1：一次迟到的冷加载 / 强制读取不得用旧内容覆盖比它新的缓存（R2-ISS-045 同型）
 let profileConfigVersion = 0
 
+// 写队列内读取 profile.yaml：缺 items 视为空列表，非对象报错，避免把坏内容当配置处理
+async function readProfileConfigFromDisk(): Promise<IProfileConfig> {
+  const data = await readFile(profileConfigPath(), 'utf-8')
+  const parsed = (parse(data) || { items: [] }) as IProfileConfig
+  if (typeof parsed !== 'object' || parsed === null) {
+    throw new Error('Profile config is invalid')
+  }
+  if (!Array.isArray(parsed.items)) parsed.items = []
+  return parsed
+}
+
+// 写 profile.yaml 前的记录合并：两边取并集，任何一侧独有的参数都不会因为一次写入而消失。
+// 两种“缺失”语义：
+// - 'keep-undefined'：值为 undefined 视为“本次没有给出”，沿用原值。用于订阅刷新——服务端可能不再返回
+//   profile-web-page-url / subscription-userinfo，整体替换会把记录里已有的 home / extra 抹掉。
+// - 'keep-absent'：载荷里出现过的键（哪怕值为 undefined，即“清空”）按载荷写入，未出现的键沿用原值。
+//   用于用户编辑等局部载荷：显式清空仍然生效，没提到的参数不会丢。
+type ProfileMergeMode = 'keep-undefined' | 'keep-absent'
+
+function mergeProfileItem(
+  previous: IProfileItem | undefined,
+  next: Partial<IProfileItem>,
+  mode: ProfileMergeMode
+): IProfileItem {
+  if (!previous) return next as IProfileItem
+  const merged: Record<string, unknown> = { ...previous }
+  for (const [key, value] of Object.entries(next)) {
+    if (mode === 'keep-undefined' && value === undefined) continue
+    merged[key] = value
+  }
+  return merged as unknown as IProfileItem
+}
+
 export async function getProfileConfig(force = false): Promise<IProfileConfig> {
   if (force || !profileConfig) {
     const seen = profileConfigVersion
@@ -109,7 +147,22 @@ export async function getProfileConfig(force = false): Promise<IProfileConfig> {
 
 export async function setProfileConfig(config: IProfileConfig): Promise<void> {
   await profileConfigWriteQueue.run(async () => {
-    const nextConfig = JSON.parse(JSON.stringify(config)) as IProfileConfig
+    // 渲染层提交的是整份列表（排序/整表写入）：逐条与磁盘上的原记录合并，未给出的字段不因一次排序而丢。
+    // 列表里没有的记录仍按删除处理（只处理入参列表）；读不到原文件时按空列表处理，与旧行为一致
+    const previousItems = await readProfileConfigFromDisk()
+      .then((current) => current.items ?? [])
+      .catch(() => [] as IProfileItem[])
+    const merged: IProfileConfig = {
+      ...config,
+      items: (config.items ?? []).map((item) =>
+        mergeProfileItem(
+          previousItems.find((i) => i.id === item.id),
+          item,
+          'keep-absent'
+        )
+      )
+    }
+    const nextConfig = JSON.parse(JSON.stringify(merged)) as IProfileConfig
     await atomicWriteFile(profileConfigPath(), stringify(nextConfig), { encoding: 'utf8' })
     profileConfig = nextConfig
     profileConfigVersion++
@@ -123,12 +176,7 @@ export async function updateProfileConfig(
   signal?: AbortSignal
 ): Promise<IProfileConfig> {
   return await profileConfigWriteQueue.run(async () => {
-    const data = await readFile(profileConfigPath(), 'utf-8')
-    const currentConfig = (parse(data) || { items: [] }) as IProfileConfig
-    if (typeof currentConfig !== 'object') {
-      throw new Error('Profile config is invalid')
-    }
-    if (!Array.isArray(currentConfig.items)) currentConfig.items = []
+    const currentConfig = await readProfileConfigFromDisk()
     const nextConfig = await updater(JSON.parse(JSON.stringify(currentConfig)))
     await atomicWriteFile(profileConfigPath(), stringify(nextConfig), { encoding: 'utf8' })
     profileConfig = nextConfig
@@ -193,19 +241,42 @@ export async function updateProfileItem(item: IProfileItem): Promise<void> {
     if (index === -1) {
       throw new Error('Profile not found')
     }
-    config.items[index] = item
+    // 与磁盘上的原记录合并：载荷里没提到的参数保留原值；载荷里显式给出的 undefined（如清空 ageSecretKey /
+    // userAgent）仍然写入，序列化时该字段会被移除，所以“清空”依旧生效
+    config.items[index] = mergeProfileItem(config.items[index], item, 'keep-absent')
     return config
   })
 }
 
+// 写 profile.yaml 时以磁盘上的原记录为底与新记录合并（两边取并集，见 mergeProfileItem）
 export async function addProfileItem(item: Partial<IProfileItem>): Promise<void> {
+  // 拉取开始前记下该 id 的删除序号（只有调用方给了 id 时才可能已经在删除状态）
+  const deletionEpoch = item.id ? profileDeletionEpoch.get(item.id) : undefined
   const newItem = await createProfile(item)
+  // 拉取期间用户删掉了这个订阅：丢弃本次结果，并把 createProfile 刚写下的订阅文件清掉（记录本就不在了，
+  // 不需要再走一遍删除流程；清理失败只告警，绝不因此把记录写回来）
+  if (item.id && profileDeletionEpoch.get(item.id) !== deletionEpoch) {
+    await profileLogger.info(
+      `Profile ${newItem.id} was deleted while refreshing; dropping the fetched result`
+    )
+    try {
+      await rm(profilePath(newItem.id), { force: true })
+    } catch (error) {
+      await profileLogger.warn(`Failed to remove the fetched file of ${newItem.id}`, error)
+    }
+    return
+  }
   let shouldChangeCurrent = false
   let newProfileIsCurrentAfterUpdate = false
   await updateProfileConfig((config) => {
     const existingIndex = config.items.findIndex((i) => i.id === newItem.id)
     if (existingIndex !== -1) {
-      config.items[existingIndex] = newItem
+      // 与磁盘上的原记录合并，而不是整体替换：本次没有给出的参数保留原值，本次新增的参数照常写入
+      const merged = mergeProfileItem(config.items[existingIndex], newItem, 'keep-undefined')
+      // 例外：extra 是本次响应的实时数据（流量），服务端没给就清空，而不是沿用旧的过期数字。
+      // createProfile 只在响应带 subscription-userinfo 时才写 extra，“新记录里没有 extra”＝本次没给。
+      if (!('extra' in newItem)) delete merged.extra
+      config.items[existingIndex] = merged
     } else {
       config.items.push(newItem)
     }
@@ -232,7 +303,8 @@ export async function addProfileItem(item: Partial<IProfileItem>): Promise<void>
   if (shouldChangeCurrent) {
     await changeCurrentProfile(newItem.id)
   }
-  await addProfileUpdater(newItem)
+  // 定时器按落盘后的记录装配：合并保留了原值（如 interval）时，调度必须与磁盘一致，而不是与本次下载的快照一致
+  await addProfileUpdater((await getProfileItem(newItem.id)) ?? newItem)
 }
 
 export async function removeProfileItem(id: string): Promise<void> {
@@ -296,6 +368,8 @@ async function removeProfileItemSteps(id: string): Promise<IProfileItem | undefi
       }
       return config
     })
+    // 记录已从磁盘移除：登记删除序号，在途刷新不得把本次结果写回来
+    profileDeletionEpoch.set(id, ++profileDeletionCounter)
   } catch (e) {
     // 记录还在（任何一步失败——配置写入、核心重启、文件 / 工作目录删除）：把定时器装回去，留给用户重试
     if (item) await addProfileUpdater(item)
@@ -490,6 +564,12 @@ export async function createProfile(item: Partial<IProfileItem>): Promise<IProfi
     ageSecretKey: item.ageSecretKey,
     updated: new Date().getTime(),
     updateTimeout: item.updateTimeout
+  }
+  // 请求里额外给出的字段（包括接口上尚未定义的新参数）一并写进记录，避免“新参数进不了 profile.yaml”；
+  // file 是本地订阅正文、extra 是只能来自订阅响应的实时数据（见 addProfileItem 的清空规则），都不从请求带过来
+  for (const [key, value] of Object.entries(item)) {
+    if (key === 'file' || key === 'extra' || value === undefined || key in newItem) continue
+    Object.assign(newItem, { [key]: value })
   }
 
   // Local
