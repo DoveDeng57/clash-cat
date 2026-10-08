@@ -46,7 +46,7 @@ import {
   mihomoHotReloadConfig,
   getAxios
 } from './mihomoApi'
-import { generateProfile } from './factory'
+import { generateProfile, getRuntimeConfig } from './factory'
 import { syncControlDnsAfterApply, type DnsOverrideGuardResult } from './dnsOverrideGuard'
 import { syncSmartModelToTestDir } from './smartModel'
 import {
@@ -85,7 +85,9 @@ const execFilePromise = promisify(execFile)
 const ctlParam = process.platform === 'win32' ? '-ext-ctl-pipe' : '-ext-ctl-unix'
 const coreHookTimeout = 30000
 const automaticRestartDelay = 750
-const coreShutdownTimeout = 500
+// macOS 释放 utun 通常需要 1-2 秒；等待 3 秒后再升级为 SIGKILL，
+// 避免新核心启动时旧核心仍占用虚拟网卡。
+const coreShutdownTimeout = 3000
 const resumeReloadDelay = 5000
 // 同一次失败内核可能连打多行，10 秒内只提示一次，避免弹窗刷屏
 const tunFailureReportInterval = 10000
@@ -452,7 +454,7 @@ async function prepareCore(detached: boolean, skipStop = false): Promise<CoreCon
 
   const [appConfig, mihomoConfig] = await Promise.all([getAppConfig(), getControledMihomoConfig()])
 
-  const {
+  let {
     core = 'mihomo',
     autoSetDNS = true,
     diffWorkDir = false,
@@ -460,8 +462,9 @@ async function prepareCore(detached: boolean, skipStop = false): Promise<CoreCon
     coreStartupMode = 'log',
     testProfileOnStart = true
   } = appConfig
+  if (appConfig.operationMode === 'simple') diffWorkDir = false
 
-  const { 'log-level': logLevel = 'info' as LogLevel, tun } = mihomoConfig
+  let { 'log-level': logLevel = 'info' as LogLevel, tun } = mihomoConfig
 
   // 清理轻量模式遗留的后台核心
   await stopPidFileCore()
@@ -471,6 +474,11 @@ async function prepareCore(detached: boolean, skipStop = false): Promise<CoreCon
 
   // generateProfile 返回实际使用的 current
   const { profileId: current, dnsGuard } = await generateProfile()
+  if (appConfig.operationMode === 'simple') {
+    const simpleRuntime = await getRuntimeConfig()
+    logLevel = simpleRuntime['log-level'] || 'info'
+    tun = simpleRuntime.tun
+  }
   const ageSecretKey = (await getProfileItem(current))?.ageSecretKey || ''
   if (testProfileOnStart) {
     await checkProfile(current, core, diffWorkDir, ageSecretKey)
@@ -737,12 +745,27 @@ function setupCoreListeners(
       (process.platform === 'win32' && str.includes('RESTful API pipe listening at'))
 
     if (isApiReady) {
-      try {
-        await startMihomoApiStreams()
-        resolveStartup([completeCoreStartup()])
-      } catch (error) {
-        rejectStartup(error)
-      }
+      resolveStartup([
+        new Promise((innerResolve) => {
+          proc.stdout?.on('data', async (innerData) => {
+            if (
+              innerData
+                .toString()
+                .toLowerCase()
+                .includes('start initial compatible provider default')
+            ) {
+              completeCoreStartup()
+                .then(() => innerResolve())
+                .catch((error) => {
+                  managerLogger.warn('Failed to complete core startup', error)
+                  innerResolve()
+                })
+            }
+          })
+        })
+      ])
+
+      await startMihomoApiStreams()
     }
   })
 
@@ -846,7 +869,16 @@ async function stopCoreInternal(force = false, cancelStartup = true): Promise<vo
     }
   }
 
-  stopCoreProcessAndStreams(cancelStartup)
+  const stoppedChild = stopCoreProcessAndStreams(cancelStartup)
+
+  try {
+    await ensureCoreProcessExited(stoppedChild)
+  } catch (error) {
+    managerLogger.error(
+      `Core PID ${stoppedChild?.pid ?? 'unknown'} refused to exit within ${coreShutdownTimeout}ms`,
+      error
+    )
+  }
 
   await cleanupStoppedCoreResources()
 }
@@ -862,7 +894,11 @@ function stopCoreProcessAndStreams(
   const stoppedChild = child
   if (child) {
     child.removeAllListeners()
-    child.kill('SIGINT')
+    try {
+      child.kill('SIGINT')
+    } catch (error) {
+      managerLogger.warn(`Failed to send SIGINT to core PID ${child.pid ?? 'unknown'}`, error)
+    }
     child = null
   }
 
@@ -933,9 +969,7 @@ async function ensureCoreProcessExited(proc: ChildProcess | null): Promise<void>
 
 async function restartCoreOnce(forceStop: boolean): Promise<void> {
   const startAttempt = await runCoreOperation(async () => {
-    const previousChild = child
     await stopCoreInternal(forceStop)
-    if (process.platform === 'darwin') await ensureCoreProcessExited(previousChild)
     return startCoreInternal(false, true)
   })
   await startAttempt.readiness
@@ -1050,6 +1084,7 @@ async function checkProfile(
 }
 
 export interface CheckProfileOptions {
+  workDir?: string
   // 调用方的预算 signal：中止后校验子进程被终止，校验按失败处理（调用方不得再写入）
   signal?: AbortSignal
   // 校验子进程的硬上限（毫秒）：防止一次 `-t` 无限期占住调用方持有的锁
@@ -1066,11 +1101,15 @@ export async function checkProfileConfig(
   await syncSmartModelToTestDir()
 
   try {
-    await execFilePromise(corePath, ['-t', '-f', configPath, '-d', mihomoTestDir()], {
-      env: buildCoreEnv(undefined, ageSecretKey),
-      signal: opts.signal,
-      timeout: opts.timeoutMs
-    })
+    await execFilePromise(
+      corePath,
+      ['-t', '-f', configPath, '-d', opts.workDir ?? mihomoTestDir()],
+      {
+        env: buildCoreEnv(undefined, ageSecretKey),
+        signal: opts.signal,
+        timeout: opts.timeoutMs
+      }
+    )
   } catch (error) {
     managerLogger.error('Profile check failed', error)
 

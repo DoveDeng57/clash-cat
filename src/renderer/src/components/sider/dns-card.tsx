@@ -1,15 +1,16 @@
-import { Button, Card, CardBody, CardFooter, Spinner, Tooltip } from '@heroui/react'
+import { Button, Card, CardBody, CardFooter, Tooltip } from '@heroui/react'
 import { toast } from '@renderer/components/base/toast'
 import BorderSwitch from '@renderer/components/base/border-switch'
 import BaseConfirmModal from '@renderer/components/base/base-confirm-modal'
 import { LuServer } from 'react-icons/lu'
 import { useLocation, useNavigate } from 'react-router-dom'
-import { setControlDns } from '@renderer/utils/ipc'
+import { patchControledMihomoConfig, setControlDns, getSimpleConfig } from '@renderer/utils/ipc'
 import { useSortable } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { useAppConfig } from '@renderer/hooks/use-app-config'
 import React, { useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import useSWR from 'swr'
 import { DEFAULT_CONTROL_DNS } from '../../../../shared/appConfig'
 
 interface Props {
@@ -18,6 +19,10 @@ interface Props {
 const DNSCard: React.FC<Props> = (props) => {
   const { t } = useTranslation()
   const { appConfig, mutateAppConfig } = useAppConfig()
+  const { data: simpleState, mutate: mutateSimpleState } = useSWR(
+    appConfig?.operationMode === 'simple' ? 'getSimpleConfig' : null,
+    getSimpleConfig
+  )
   const { iconOnly } = props
   const [applying, setApplying] = useState(false)
   // 弹窗保存待确认指纹，开关以后端状态为准。
@@ -25,11 +30,15 @@ const DNSCard: React.FC<Props> = (props) => {
   const {
     dnsCardStatus = 'col-span-1',
     controlDns = DEFAULT_CONTROL_DNS,
-    disableAnimations = false
+    disableAnimations = false,
+    operationMode = 'standard'
   } = appConfig || {}
   const location = useLocation()
   const navigate = useNavigate()
   const match = location.pathname.includes('/dns')
+  const simpleDnsEnabled = simpleState
+    ? !/^enable:\s*false\s*$/m.test(simpleState.published.modules.dns || '')
+    : true
   const {
     attributes,
     listeners,
@@ -45,6 +54,11 @@ const DNSCard: React.FC<Props> = (props) => {
     if (applying) return
     setApplying(true)
     try {
+      if (operationMode === 'simple') {
+        await patchControledMihomoConfig({ dns: { enable: enabled } })
+        await mutateSimpleState()
+        return
+      }
       const result = await setControlDns(enabled, confirmed)
       // 来源变化时保留弹窗，换用新指纹。
       setConfirmation(result.status === 'confirm-required' ? result.confirmation : null)
@@ -62,7 +76,10 @@ const DNSCard: React.FC<Props> = (props) => {
   if (iconOnly) {
     return (
       <div className={`${dnsCardStatus} flex justify-center`}>
-        <Tooltip content={t('sider.cards.dns')} placement="right">
+        <Tooltip
+          content={operationMode === 'simple' ? 'DNS' : t('sider.cards.dns')}
+          placement="right"
+        >
           <Button
             size="sm"
             isIconOnly
@@ -108,22 +125,18 @@ const DNSCard: React.FC<Props> = (props) => {
                 className={`${match ? 'text-primary-foreground' : 'text-foreground'} text-[24px] font-bold`}
               />
             </Button>
-            <div className="flex items-center">
-              {applying && <Spinner size="sm" color={match ? 'white' : 'primary'} />}
-              <BorderSwitch
-                isShowBorder={match && controlDns}
-                isSelected={controlDns}
-                isDisabled={applying}
-                onValueChange={onChange}
-              />
-            </div>
+            <BorderSwitch
+              isShowBorder={match && (operationMode === 'simple' ? simpleDnsEnabled : controlDns)}
+              isSelected={operationMode === 'simple' ? simpleDnsEnabled : controlDns}
+              onValueChange={onChange}
+            />
           </div>
         </CardBody>
         <CardFooter className="pt-1">
           <h3
             className={`text-md font-bold sider-card-title ${match ? 'text-primary-foreground' : 'text-foreground'}`}
           >
-            {t('sider.cards.dns')}
+            {operationMode === 'simple' ? 'DNS' : t('sider.cards.dns')}
           </h3>
         </CardFooter>
       </Card>
